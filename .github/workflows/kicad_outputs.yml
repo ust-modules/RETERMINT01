@@ -151,19 +151,44 @@ jobs:
           token: ${{ secrets.pat }}
           ref: ${{ github.head_ref }}
 
+      - name: "Prepare output directory"
+        # bom_and_placement.kibot.yaml runs 'kibom' and 'position' outputs in one
+        # KiBot invocation. 'kibom' writes its config.kibom.ini here during the
+        # config phase (before any output actually runs), and KiBot only creates
+        # this directory lazily per-output at generation time - so with a single
+        # invocation nothing has created it yet at that point. It used to exist
+        # by the time this ran only because a separate, earlier KiBot invocation
+        # (placement.kibot.yaml's 'position' output) had already created it as a
+        # side effect. Create it explicitly instead of relying on that ordering.
+        run: mkdir -p ${{ env.dir }}_docs/${{ matrix.name }}
+
       - uses: INTI-CMNB/KiBot@v2_dk10
         with:
-          config: ${{ env.kibot }}/placement.kibot.yaml
+          config: ${{ env.kibot }}/bom_and_placement.kibot.yaml
           schema: ${{ matrix.schema }}
           board: ${{ matrix.board }}
           dir: ${{ env.dir }}_docs/${{ matrix.name }}
 
-      - uses: INTI-CMNB/KiBot@v2_dk10
-        with:
-          config: ${{ env.kibot }}/xml.kibot.yaml
-          schema: ${{ matrix.schema }}
-          board: ${{ matrix.board }}
-          dir: ${{ env.dir }}_docs/${{ matrix.name }}
+      - name: "Merge PCB side/position into netlist"
+        # Netlists are exported from the schematic, before layout exists, so they
+        # never carry which side of the board a ref sits on. This copies Side/
+        # PosX/PosY/Rotation from the PnP CSV (produced by the KiBot step above)
+        # into the netlist's <fields>, matched by reference designator, so
+        # downstream BOM importers (e.g. NextIntranet) can read it without a
+        # second file. See merge_netlist_placement.py --help for the contract.
+        run: |
+          NETLIST=$(find ${{ matrix.dir }} -maxdepth 1 -name '*.xml' | head -1)
+          PNP=$(find "${{ env.dir }}_docs/${{ matrix.name }}/PnP" -maxdepth 1 -name '*_cpl_both_pos.csv' | head -1)
+          if [ -n "$NETLIST" ] && [ -n "$PNP" ]; then
+            echo "Merging $PNP into $NETLIST"
+            # update_xml (run inside the KiBot action's container) writes this
+            # file as root; reclaim ownership before a normal-user write, same
+            # reason the "Rename output" step below uses sudo mv.
+            sudo chown "$(id -u):$(id -g)" "$NETLIST"
+            python3 ${{ env.kibot }}/merge_netlist_placement.py "$NETLIST" "$PNP" -o "$NETLIST"
+          else
+            echo "::warning::Netlist or PnP CSV not found, skipping side/position merge (NETLIST='$NETLIST' PNP='$PNP')"
+          fi
 
       - name: "Collect files"
         run: |
